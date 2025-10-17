@@ -43,7 +43,6 @@ export const useVoiceCall = () => {
         // const arrayBuffer = await message.arrayBuffer()
         // const float32 = binaryPCMToFloat32(arrayBuffer)
         // playPCMChunk(float32)
-
         // opus
         const float32Audio = decodeOpusPacket(message);
         processDecodedChunks(float32Audio);

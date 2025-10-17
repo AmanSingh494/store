@@ -25,7 +25,6 @@ export function useAudioPlayback() {
     isCollectingAudio.current = true;
     logger.log("[AudioDebug] Started collecting audio chunks for this turn");
   }, []);
-
   // Function to create and connect the AudioContext and WorkletNode
   const setupAudio = useCallback(async () => {
     if (audioContextRef.current) {
@@ -176,12 +175,19 @@ export function useAudioPlayback() {
         logger.log(`[AudioPlayback] Mixed ${numberOfChannels} channels to mono`);
       }
 
+      // ✅ ADD THIS RESAMPLING STEP:
+      // if (sampleRate !== 24000) {
+      //   logger.log(`[AudioPlayback] Resampling from ${sampleRate}Hz to 24kHz`);
+      //   const resampledBuffer = resampleTo24kHz(monoBuffer, sampleRate);
+      //   return resampledBuffer;
+      // }
+
       return monoBuffer;
     },
     []
-  );
+    // [resampleTo24kHz]
+  ); // ✅ Add dependency
 
-  // Update the WebCodecs decoder configuration for raw Opus
   const initWebCodecsDecoder = useCallback(async () => {
     if (!webCodecsDecoderRef.current) {
       try {
@@ -192,148 +198,146 @@ export function useAudioPlayback() {
           throw new Error("WebCodecs AudioDecoder not supported in this browser");
         }
 
-        // Configure the decoder for raw Opus packets
-        const config = {
-          codec: "opus",
-          sampleRate: 24000, // Opus always decodes to 48kHz internally
-          numberOfChannels: 1, // Mono
-          // For raw Opus, we don't need container-specific config
-        };
+        // Try different configurations to find what works
+        const configs = [
+          { codec: "opus", sampleRate: 48000, numberOfChannels: 1 }, // Mono
+          { codec: "opus", sampleRate: 48000, numberOfChannels: 2 }, // Stereo
+          { codec: "opus", sampleRate: 24000, numberOfChannels: 1 }, // Lower sample rate
+        ];
 
-        // Check if the configuration is supported
-        // eslint-disable-next-line no-undef
-        const support = await AudioDecoder.isConfigSupported(config);
-        if (!support.supported) {
-          throw new Error(`Raw Opus codec configuration not supported: ${JSON.stringify(support)}`);
+        let workingConfig = null;
+
+        for (const config of configs) {
+          try {
+            logger.log("[AudioPlayback] Testing config:", config);
+
+            // eslint-disable-next-line no-undef
+            const support = await AudioDecoder.isConfigSupported(config);
+            logger.log("[AudioPlayback] Config support result:", support);
+
+            if (support.supported) {
+              workingConfig = config;
+              break;
+            }
+          } catch (configError) {
+            logger.warn("[AudioPlayback] Config test failed:", configError);
+          }
         }
 
-        logger.log("[AudioPlayback] WebCodecs raw Opus config supported:", support);
+        if (!workingConfig) {
+          throw new Error("No supported Opus configuration found");
+        }
 
-        // Create the decoder
+        logger.log("[AudioPlayback] Using working config:", workingConfig);
+
+        // Create the decoder with enhanced error handling
         // eslint-disable-next-line no-undef
         webCodecsDecoderRef.current = new AudioDecoder({
           output: (audioData) => {
-            logger.log("[AudioPlayback] WebCodecs decoded raw Opus frame:", {
-              numberOfFrames: audioData.numberOfFrames,
-              numberOfChannels: audioData.numberOfChannels,
-              sampleRate: audioData.sampleRate,
-              timestamp: audioData.timestamp,
-              duration: audioData.duration,
-            });
+            try {
+              logger.log("[AudioPlayback] ✅ WebCodecs decoded Opus frame successfully:", {
+                numberOfFrames: audioData.numberOfFrames,
+                numberOfChannels: audioData.numberOfChannels,
+                sampleRate: audioData.sampleRate,
+                timestamp: audioData.timestamp,
+                duration: audioData.duration,
+              });
 
-            // Convert AudioData to Float32Array
-            const float32Data = convertAudioDataToFloat32Array(audioData);
+              // Convert AudioData to Float32Array
+              const float32Data = convertAudioDataToFloat32Array(audioData);
 
-            // Process immediately since it's already properly formatted
-            if (float32Data && float32Data.length > 0) {
-              processDirectPCM(float32Data);
+              // Process immediately since it's already properly formatted
+              if (float32Data && float32Data.length > 0) {
+                processDirectPCM(float32Data);
+              } else {
+                logger.warn("[AudioPlayback] Converted audio data is empty");
+              }
+
+              // Close the AudioData to free memory
+              audioData.close();
+            } catch (outputError) {
+              logger.error("[AudioPlayback] Error in decoder output handler:", outputError);
+              audioData.close();
             }
-
-            // Close the AudioData to free memory
-            audioData.close();
           },
           error: (error) => {
-            logger.error("[AudioPlayback] WebCodecs raw Opus decoder error:", error);
+            logger.error("[AudioPlayback] ❌ WebCodecs decoder error details:", {
+              name: error.name,
+              message: error.message,
+              code: error.code,
+              stack: error.stack,
+            });
+
+            // Log decoder state when error occurs
+            if (webCodecsDecoderRef.current) {
+              logger.error("[AudioPlayback] Decoder state during error:", webCodecsDecoderRef.current.state);
+            }
+
             // Reset decoder on error
             webCodecsDecoderRef.current = null;
           },
         });
 
-        logger.log("[AudioPlayback] WebCodecs decoder created, state:", webCodecsDecoderRef.current.state);
+        logger.log("[AudioPlayback] WebCodecs decoder created, configuring...");
 
         // Configure the decoder
-        webCodecsDecoderRef.current.configure(config);
+        webCodecsDecoderRef.current.configure(workingConfig);
 
-        logger.log("[AudioPlayback] WebCodecs decoder configured, state:", webCodecsDecoderRef.current.state);
+        // Wait a bit for configuration
+        await new Promise((resolve) => setTimeout(resolve, 50));
 
-        // Wait for configuration to complete
-        await new Promise((resolve) => setTimeout(resolve, 10));
-
-        logger.log("[AudioPlayback] WebCodecs decoder final state:", webCodecsDecoderRef.current.state);
+        logger.log("[AudioPlayback] WebCodecs decoder configured, final state:", webCodecsDecoderRef.current.state);
 
         // Verify decoder is ready
         if (webCodecsDecoderRef.current.state !== "configured") {
           throw new Error(`Decoder not configured properly, state: ${webCodecsDecoderRef.current.state}`);
         }
 
-        logger.log("[AudioPlayback] WebCodecs raw Opus AudioDecoder initialized successfully");
+        logger.log("[AudioPlayback] ✅ WebCodecs raw Opus AudioDecoder initialized successfully");
       } catch (error) {
-        logger.error("[AudioPlayback] Failed to initialize WebCodecs raw Opus decoder:", error);
+        logger.error("[AudioPlayback] ❌ Failed to initialize WebCodecs decoder:", error);
         webCodecsDecoderRef.current = null;
         throw error;
       }
     }
   }, [processDirectPCM, convertAudioDataToFloat32Array]);
 
-  // Updated decode function for raw Opus packets
+  const validateOpusPacket = useCallback((packetData) => {
+    if (packetData.length === 0) {
+      return { valid: false, reason: "Empty packet" };
+    }
+
+    const tocByte = packetData[0];
+    const config = (tocByte >> 3) & 0x1f;
+    const stereo = (tocByte & 0x04) !== 0;
+    const frameCount = tocByte & 0x03;
+
+    // Log detailed packet info
+    const validation = {
+      valid: config <= 31,
+      reason: config > 31 ? "Invalid config" : "OK",
+      size: packetData.length,
+      tocByte: `0x${tocByte.toString(16).padStart(2, "0")}`,
+      config: config,
+      stereo: stereo,
+      frameCount: frameCount === 0 ? 1 : frameCount === 3 ? "variable" : frameCount + 1,
+      firstFewBytes: Array.from(packetData.slice(0, Math.min(16, packetData.length))).map(
+        (b) => `0x${b.toString(16).padStart(2, "0")}`
+      ),
+    };
+
+    logger.log("[AudioPlayback] Opus packet validation:", validation);
+    return validation;
+  }, []);
+  // Enhanced decode function with detailed logging
   const decodeOpusPacket = useCallback(
     async (opusPacket) => {
-      logger.log("[AudioPlayback] Decoding raw Opus packet with WebCodecs API");
-
       try {
-        // Initialize decoder if needed
         if (!webCodecsDecoderRef.current) {
-          logger.log("[AudioPlayback] No decoder found, initializing...");
+          logger.log("[AudioPlayback] Initializing decoder for Opus packet...");
           await initWebCodecsDecoder();
         }
 
-        const decoder = webCodecsDecoderRef.current;
-
-        // Detailed state checking
-        if (!decoder) {
-          logger.error("[AudioPlayback] WebCodecs decoder is null");
-          return new Float32Array(480);
-        }
-
-        logger.log("[AudioPlayback] Decoder state before check:", decoder.state);
-
-        // Handle different decoder states
-        if (decoder.state === "unconfigured") {
-          logger.log("[AudioPlayback] Decoder unconfigured, reconfiguring...");
-
-          const config = {
-            codec: "opus",
-            sampleRate: 24000,
-            numberOfChannels: 1,
-          };
-
-          try {
-            decoder.configure(config);
-            await new Promise((resolve) => setTimeout(resolve, 50));
-          } catch (configError) {
-            logger.error("[AudioPlayback] Failed to reconfigure decoder:", configError);
-            webCodecsDecoderRef.current = null;
-            return new Float32Array(480);
-          }
-        }
-
-        if (decoder.state === "closed") {
-          logger.error("[AudioPlayback] Decoder is closed, reinitializing...");
-          webCodecsDecoderRef.current = null;
-          await initWebCodecsDecoder();
-          return await decodeOpusPacket(opusPacket); // Retry with new decoder
-        }
-
-        if (decoder.state !== "configured") {
-          logger.error("[AudioPlayback] WebCodecs decoder not ready, state:", decoder.state);
-
-          // Try to wait a bit more for configuration
-          let retries = 3;
-          while (retries > 0 && decoder.state !== "configured") {
-            logger.log(`[AudioPlayback] Waiting for decoder configuration... (${retries} retries left)`);
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            retries--;
-          }
-
-          if (decoder.state !== "configured") {
-            logger.error("[AudioPlayback] Decoder configuration timeout, state:", decoder.state);
-            return new Float32Array(480);
-          }
-        }
-
-        logger.log("[AudioPlayback] Decoder ready, state:", decoder.state);
-
-        // Convert input to Uint8Array
         let packetData;
         if (opusPacket instanceof ArrayBuffer) {
           packetData = new Uint8Array(opusPacket);
@@ -343,104 +347,41 @@ export function useAudioPlayback() {
         } else if (opusPacket instanceof Uint8Array) {
           packetData = opusPacket;
         } else {
-          logger.error("[AudioPlayback] Invalid raw Opus packet format:", typeof opusPacket);
-          return new Float32Array(480);
+          logger.error("[AudioPlayback] Invalid packet type:", typeof opusPacket);
+          return;
         }
 
-        if (packetData.length === 0) {
-          logger.warn("[AudioPlayback] Empty raw Opus packet received");
-          return new Float32Array(480);
+        // Check decoder state
+        if (!webCodecsDecoderRef.current || webCodecsDecoderRef.current.state !== "configured") {
+          logger.error(`[AudioPlayback] Decoder not ready, state: ${webCodecsDecoderRef.current?.state || "null"}`);
+          return;
+        }
+        logger.log("[AudioPlayback] Deepgram raw Opus detected, decoding directly...");
+
+        // Validate raw packet
+        const validation = validateOpusPacket(packetData);
+        if (!validation.valid) {
+          logger.error("[AudioPlayback] Invalid raw Opus packet:", validation);
+          return;
         }
 
-        // Log raw Opus packet info
-        logger.log(`[AudioPlayback] Raw Opus packet: ${packetData.length} bytes`);
-        logger.log(
-          "[AudioPlayback] First 16 bytes:",
-          Array.from(packetData.slice(0, 16))
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join(" ")
-        );
-
-        // Validate Opus packet (basic check)
-        if (packetData.length < 1) {
-          logger.warn("[AudioPlayback] Opus packet too small");
-          return new Float32Array(480);
-        }
-
-        // Check Opus TOC (Table of Contents) byte
-        const tocByte = packetData[0];
-        const opusMode = (tocByte >> 3) & 0x1f;
-        const stereoFlag = tocByte & 0x04;
-        const frameCount = tocByte & 0x03;
-
-        logger.log("[AudioPlayback] Opus TOC analysis:", {
-          tocByte: `0x${tocByte.toString(16)}`,
-          mode: opusMode,
-          stereo: !!stereoFlag,
-          frameCount: frameCount === 0 ? 1 : frameCount === 1 ? 2 : frameCount === 2 ? 2 : "variable",
+        const timestamp = performance.now() * 1000;
+        // eslint-disable-next-line no-undef
+        const encodedChunk = new EncodedAudioChunk({
+          type: "key",
+          timestamp: timestamp,
+          data: packetData.buffer.slice(packetData.byteOffset, packetData.byteOffset + packetData.byteLength),
         });
 
-        try {
-          // Create EncodedAudioChunk for raw Opus packet
-          // eslint-disable-next-line no-undef
-          const encodedChunk = new EncodedAudioChunk({
-            type: "key", // Opus packets are typically self-contained
-            timestamp: performance.now() * 1000, // Current time in microseconds
-            data: packetData,
-          });
-
-          logger.log(`[AudioPlayback] Decoding raw Opus packet: ${packetData.length} bytes`);
-
-          // Decode the raw Opus packet
-          decoder.decode(encodedChunk);
-
-          // Processing happens asynchronously through the decoder callback
-          return new Float32Array(0);
-        } catch (decodeError) {
-          logger.error("[AudioPlayback] Error decoding raw Opus packet:", decodeError);
-
-          // Log more details about the error
-          if (decodeError.name === "EncodingError") {
-            logger.error("[AudioPlayback] Encoding error - invalid Opus packet format");
-          } else if (decodeError.name === "InvalidStateError") {
-            logger.error("[AudioPlayback] Invalid state error - decoder not ready");
-          }
-
-          return new Float32Array(480);
-        }
+        webCodecsDecoderRef.current.decode(encodedChunk);
+        logger.log("[AudioPlayback] Decoded Deepgram raw Opus packet");
       } catch (error) {
-        logger.error("[AudioPlayback] Error decoding raw Opus with WebCodecs:", error);
-
-        // Reset decoder on persistent errors
-        if (error.name === "InvalidStateError" || error.name === "NotSupportedError") {
-          logger.log("[AudioPlayback] Resetting decoder due to persistent error");
-          webCodecsDecoderRef.current = null;
-        }
-
-        return new Float32Array(480);
+        logger.error("[AudioPlayback] Error in decodeOpusPacket:", error);
+        logger.error("[AudioPlayback] Stack trace:", error.stack);
       }
     },
-    [initWebCodecsDecoder]
+    [initWebCodecsDecoder, validateOpusPacket]
   );
-
-  // Keep your existing OGG and save functions...
-  const saveRawOpusData = useCallback((audioData, filename = "raw-opus-data", saveMode = "individual") => {
-    if (isCollectingAudio.current && saveMode !== "force-individual") {
-      audioDebugRef.current.push(audioData);
-      logger.log(
-        `[AudioDebug] Added chunk ${audioDebugRef.current.length} to collection (${
-          audioData instanceof ArrayBuffer
-            ? audioData.byteLength
-            : audioData instanceof Uint8Array
-            ? audioData.byteLength
-            : audioData instanceof Blob
-            ? audioData.size
-            : "unknown"
-        } bytes)`
-      );
-      return { collected: true, chunkNumber: audioDebugRef.current.length };
-    }
-  }, []);
 
   // Your existing utility functions remain the same
   const int16ToFloat32 = useCallback((int16Array) => {
@@ -451,26 +392,21 @@ export function useAudioPlayback() {
     return float32;
   }, []);
 
-  const base64PCMToFloat32 = useCallback((base64) => {
-    const binary = atob(base64);
-    const len = binary.length / 2;
-    const int16 = new Int16Array(len);
-    for (let i = 0; i < len; i++) {
-      int16[i] = (binary.charCodeAt(i * 2 + 1) << 8) | binary.charCodeAt(i * 2);
-    }
-    return int16ToFloat32(int16);
-  }, [int16ToFloat32]);
+  const base64PCMToFloat32 = useCallback(
+    (base64) => {
+      const binary = atob(base64);
+      const len = binary.length / 2;
+      const int16 = new Int16Array(len);
+      for (let i = 0; i < len; i++) {
+        int16[i] = (binary.charCodeAt(i * 2 + 1) << 8) | binary.charCodeAt(i * 2);
+      }
+      return int16ToFloat32(int16);
+    },
+    [int16ToFloat32]
+  );
   // Update playPCMChunk to handle raw Opus
   const playPCMChunk = useCallback(
     async (audioData) => {
-      // Auto-collect raw data if collection is enabled
-      if (
-        isCollectingAudio.current &&
-        (audioData instanceof ArrayBuffer || audioData instanceof Blob || audioData instanceof Uint8Array)
-      ) {
-        saveRawOpusData(audioData, "turn-chunk", "collect");
-      }
-
       // Auto-setup audio if not ready
       if (!audioContextRef.current || !workletNodeRef.current) {
         logger.log("[AudioPlayback] Audio not set up, initializing...");
@@ -545,7 +481,7 @@ export function useAudioPlayback() {
         logger.log(`[AudioPlayback] Buffering... ${bufferMs}ms/${requiredMs}ms`);
       }
     },
-    [decodeOpusPacket, saveRawOpusData, setupAudio, base64PCMToFloat32]
+    [decodeOpusPacket, setupAudio, base64PCMToFloat32]
   );
 
   // Process decoded chunks from WebCodecs
@@ -687,10 +623,6 @@ export function useAudioPlayback() {
     };
   }, [disconnectAudio]);
 
-  
-
-  
-
   const binaryPCMToFloat32 = (arrayBuffer) => {
     if (!(arrayBuffer instanceof ArrayBuffer)) {
       logger.warn("[AudioPlayback] Invalid input: not an ArrayBuffer.");
@@ -730,7 +662,6 @@ export function useAudioPlayback() {
     base64PCMToFloat32,
     disconnectAudio,
     decodeOpusPacket, // Now uses WebCodecs
-    saveRawOpusData,
     startAudioCollection,
     resumeAfterInterrupt,
     processDecodedChunks,
